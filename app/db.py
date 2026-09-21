@@ -48,6 +48,25 @@ CREATE TABLE IF NOT EXISTS segment_changes (
     created_at   REAL    NOT NULL
 );
 -- 查询模式为 WHERE change_id > ? ORDER BY change_id，主键即索引，无需额外索引
+
+-- 人工确认审计：追加式不可变记录，确认序号 id 全局单调递增。
+-- 刻意不建外键：段被合并/撤回删除后审计记录仍完整保留（审计语义），
+-- 也不反向阻塞段的删除；新表由 CREATE TABLE IF NOT EXISTS 建立，
+-- 已有持久化卷在启动时自动补齐，无需重建迁移
+CREATE TABLE IF NOT EXISTS segment_acknowledgements (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,  -- 确认序号（单调递增）
+    segment_id        INTEGER NOT NULL,
+    operator          TEXT    NOT NULL,
+    note              TEXT    NOT NULL,
+    expected_revision INTEGER NOT NULL,          -- 请求方声明的段 revision
+    segment_revision  INTEGER NOT NULL,          -- 确认落库时刻段的实际 revision
+    idempotency_key   TEXT    NOT NULL,
+    created_at        REAL    NOT NULL,
+    UNIQUE (segment_id, idempotency_key)         -- 幂等键在段内唯一
+);
+-- 查询模式为 WHERE segment_id = ? ORDER BY id
+CREATE INDEX IF NOT EXISTS idx_segment_ack_segment
+    ON segment_acknowledgements (segment_id, id);
 """
 
 

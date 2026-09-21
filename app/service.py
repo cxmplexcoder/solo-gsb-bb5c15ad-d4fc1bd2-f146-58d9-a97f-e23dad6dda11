@@ -33,6 +33,14 @@
   支持 source 必填、起止时间与 severity 多值过滤；
 - 键集分页游标 after/next_after 为不透明字符串，编码上一页末行的
   (occurred_at, event_id) 复合位置；空页回显入参 after，游标保持不变。
+
+人工确认审计（acknowledge_segment / list_acknowledgements）：
+- 在调用方事务（BEGIN IMMEDIATE）内先按 (segment_id, idempotency_key) 查重：
+  相同键 + 相同载荷（operator/note/expected_revision 完全一致）直接返回原记录，
+  不再校验段的当前状态（即使段已变化）；相同键 + 不同载荷报载荷冲突；
+- 新键则校验段存在且 expected_revision 等于段当前 revision，
+  通过后追加一条不可变确认记录（确认序号 id 单调递增，仅追加、永不更新）；
+- 确认不改变段的 revision、不写变更流；段后续合并/删除不影响已落库的审计记录。
 """
 from __future__ import annotations
 
@@ -248,6 +256,109 @@ def list_segment_changes(
     changes = [_row_to_change(r) for r in rows]
     next_after = changes[-1]["change_id"] if changes else after
     return {"changes": changes, "next_after": next_after}
+
+
+def _row_to_acknowledgement(row: sqlite3.Row) -> dict:
+    return {
+        "ack_id": row["id"],
+        "segment_id": row["segment_id"],
+        "operator": row["operator"],
+        "note": row["note"],
+        "expected_revision": row["expected_revision"],
+        "segment_revision": row["segment_revision"],
+        "idempotency_key": row["idempotency_key"],
+        "created_at": _iso(row["created_at"]),
+    }
+
+
+def acknowledge_segment(
+    conn: sqlite3.Connection,
+    *,
+    segment_id: int,
+    operator: str,
+    note: str,
+    expected_revision: int,
+    idempotency_key: str,
+) -> dict:
+    """为事件段追加一条人工确认审计记录（不可变、仅追加）。
+
+    调用方需持有事务（建议 BEGIN IMMEDIATE）并保证串行化。返回
+    {"outcome": <结果>, ...}，outcome 取值与附加字段：
+
+    - "created"：revision 校验通过，已追加记录，"acknowledgement" 为新记录；
+    - "replayed"：幂等键重放且载荷一致，"acknowledgement" 为**原记录**——
+      不再校验段的当前状态，即使段已变化（甚至被删除）也原样返回；
+    - "payload_conflict"：幂等键已存在但载荷不同（调用方回 409）；
+    - "not_found"：段不存在（调用方回 404）；
+    - "revision_conflict"：expected_revision 与段当前 revision 不一致，
+      "segment" 为当前段快照（调用方回 409 并携带快照）。
+
+    幂等键查重先于段状态校验：重放语义不依赖段的实时状态；
+    确认记录仅追加、不可变，不改变段的 revision，也不写变更流。
+    """
+    existing = conn.execute(
+        """
+        SELECT * FROM segment_acknowledgements
+        WHERE segment_id = ? AND idempotency_key = ?
+        """,
+        (segment_id, idempotency_key),
+    ).fetchone()
+    if existing is not None:
+        same_payload = (
+            existing["operator"] == operator
+            and existing["note"] == note
+            and existing["expected_revision"] == expected_revision
+        )
+        if same_payload:
+            return {
+                "outcome": "replayed",
+                "acknowledgement": _row_to_acknowledgement(existing),
+            }
+        return {"outcome": "payload_conflict"}
+
+    segment = conn.execute(
+        "SELECT * FROM segments WHERE id = ?", (segment_id,)
+    ).fetchone()
+    if segment is None:
+        return {"outcome": "not_found"}
+    if segment["revision"] != expected_revision:
+        return {
+            "outcome": "revision_conflict",
+            "segment": _row_to_segment(segment),
+        }
+
+    cur = conn.execute(
+        """
+        INSERT INTO segment_acknowledgements
+            (segment_id, operator, note, expected_revision, segment_revision,
+             idempotency_key, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            segment_id, operator, note, expected_revision,
+            segment["revision"], idempotency_key, time.time(),
+        ),
+    )
+    row = conn.execute(
+        "SELECT * FROM segment_acknowledgements WHERE id = ?",
+        (cur.lastrowid,),
+    ).fetchone()
+    return {"outcome": "created", "acknowledgement": _row_to_acknowledgement(row)}
+
+
+def list_acknowledgements(
+    conn: sqlite3.Connection, segment_id: int
+) -> list[dict]:
+    """按确认序号（id）升序返回该段的全部人工确认记录（纯读）。"""
+    rows = conn.execute(
+        """
+        SELECT * FROM segment_acknowledgements
+        WHERE segment_id = ?
+        ORDER BY id
+        """,
+        (segment_id,),
+    ).fetchall()
+    return [_row_to_acknowledgement(r) for r in rows]
 
 
 def _find_merge_candidates(

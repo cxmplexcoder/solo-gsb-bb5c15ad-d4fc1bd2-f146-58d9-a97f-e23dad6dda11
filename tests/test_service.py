@@ -847,6 +847,123 @@ class ServiceTestCase(unittest.TestCase):
         self.assertEqual(p1, p2)
         self.assertEqual(len(p2["events"]), 1)
 
+    # ---- 人工确认审计（acknowledge_segment / list_acknowledgements）----
+
+    def ack(self, segment_id, *, operator="ops", note="n",
+            expected_revision=1, key="k1"):
+        with session(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            return service.acknowledge_segment(
+                conn,
+                segment_id=segment_id,
+                operator=operator,
+                note=note,
+                expected_revision=expected_revision,
+                idempotency_key=key,
+            )
+
+    def acks(self, segment_id):
+        with session(self.db_path) as conn:
+            return service.list_acknowledgements(conn, segment_id)
+
+    def test_acknowledge_created_when_revision_matches(self):
+        seg = self.submit("s1", "e1", 1000.0, "warning")["segment"]
+        r = self.ack(seg["id"], operator="alice", note="已确认",
+                     expected_revision=1, key="k1")
+        self.assertEqual(r["outcome"], "created")
+        a = r["acknowledgement"]
+        self.assertEqual(a["ack_id"], 1)
+        self.assertEqual(a["segment_id"], seg["id"])
+        self.assertEqual(a["operator"], "alice")
+        self.assertEqual(a["note"], "已确认")
+        self.assertEqual(a["expected_revision"], 1)
+        self.assertEqual(a["segment_revision"], 1)
+        self.assertEqual(a["idempotency_key"], "k1")
+        self.assertTrue(a["created_at"])
+        self.assertEqual(self.acks(seg["id"]), [a])
+
+    def test_acknowledge_revision_conflict_returns_current_snapshot(self):
+        self.submit("s1", "e1", 1000.0)
+        seg = self.submit("s1", "e2", 1005.0, "error")["segment"]  # rev=2
+        r = self.ack(seg["id"], expected_revision=1, key="k1")
+        self.assertEqual(r["outcome"], "revision_conflict")
+        self.assertEqual(r["segment"], self.get(seg["id"]))  # 当前段快照
+        self.assertEqual(r["segment"]["revision"], 2)
+        self.assertEqual(self.acks(seg["id"]), [])           # 冲突不落库
+        # 用正确 revision 重试同一键：可正常落库（冲突不占用幂等键）
+        r2 = self.ack(seg["id"], expected_revision=2, key="k1")
+        self.assertEqual(r2["outcome"], "created")
+        self.assertEqual(r2["acknowledgement"]["segment_revision"], 2)
+
+    def test_acknowledge_unknown_segment_not_found(self):
+        r = self.ack(9999, expected_revision=1, key="k1")
+        self.assertEqual(r["outcome"], "not_found")
+
+    def test_acknowledge_replay_returns_original_even_after_segment_changes(self):
+        seg = self.submit("s1", "e1", 1000.0)["segment"]
+        first = self.ack(seg["id"], operator="alice", note="n",
+                         expected_revision=1, key="k1")["acknowledgement"]
+        # 段随后发生变化：revision 升到 2，原 expected_revision 已过期
+        self.submit("s1", "e2", 1005.0, "critical")
+        self.assertEqual(self.get(seg["id"])["revision"], 2)
+        replay = self.ack(seg["id"], operator="alice", note="n",
+                          expected_revision=1, key="k1")
+        self.assertEqual(replay["outcome"], "replayed")
+        self.assertEqual(replay["acknowledgement"], first)  # 原记录原样返回
+        self.assertEqual(len(self.acks(seg["id"])), 1)      # 不产生重复记录
+
+    def test_acknowledge_same_key_different_payload_conflicts(self):
+        seg = self.submit("s1", "e1", 1000.0)["segment"]
+        self.ack(seg["id"], operator="alice", note="n",
+                 expected_revision=1, key="k1")
+        for kwargs in ({"operator": "bob"}, {"note": "other"},
+                       {"expected_revision": 2}):
+            r = self.ack(seg["id"], key="k1", **kwargs)
+            self.assertEqual(r["outcome"], "payload_conflict")
+        self.assertEqual(len(self.acks(seg["id"])), 1)
+
+    def test_acknowledge_key_scoped_per_segment(self):
+        a = self.submit("s1", "e1", 1000.0)["segment"]
+        b = self.submit("s2", "e2", 1000.0)["segment"]
+        r1 = self.ack(a["id"], key="same-key")
+        r2 = self.ack(b["id"], key="same-key")  # 不同段复用同键互不干扰
+        self.assertEqual(r1["outcome"], "created")
+        self.assertEqual(r2["outcome"], "created")
+        self.assertNotEqual(
+            r1["acknowledgement"]["ack_id"], r2["acknowledgement"]["ack_id"]
+        )
+
+    def test_acknowledge_list_ordered_by_ack_id(self):
+        seg = self.submit("s1", "e1", 1000.0)["segment"]
+        other = self.submit("s2", "e2", 1000.0)["segment"]
+        self.ack(seg["id"], key="k1")
+        self.ack(other["id"], key="k2")  # 交织写入其他段，不影响本段次序
+        self.ack(seg["id"], key="k3")
+        self.ack(seg["id"], key="k2")
+        rows = self.acks(seg["id"])
+        self.assertEqual([r["idempotency_key"] for r in rows], ["k1", "k3", "k2"])
+        ids = [r["ack_id"] for r in rows]
+        self.assertEqual(ids, sorted(ids))
+
+    def test_acknowledge_does_not_touch_segment_or_change_stream(self):
+        seg = self.submit("s1", "e1", 1000.0)["segment"]
+        before_seg = self.get(seg["id"])
+        before_changes = self.changes()
+        self.ack(seg["id"], expected_revision=1, key="k1")
+        self.assertEqual(self.get(seg["id"]), before_seg)      # revision 不变
+        self.assertEqual(self.changes(), before_changes)       # 不写变更流
+
+    def test_acknowledge_records_survive_segment_deletion(self):
+        seg = self.submit("s1", "e1", 1000.0)["segment"]
+        first = self.ack(seg["id"], key="k1")["acknowledgement"]
+        self.withdraw("s1", "e1")  # 唯一事件撤回 → 段被删除
+        self.assertIsNone(self.get(seg["id"]))
+        # 审计记录仍保留；幂等重放（查重先于段状态校验）仍返回原记录
+        replay = self.ack(seg["id"], key="k1")
+        self.assertEqual(replay["outcome"], "replayed")
+        self.assertEqual(replay["acknowledgement"], first)
+        self.assertEqual(self.acks(seg["id"]), [first])
+
     # ---- 旧库迁移（segment_changes CHECK 增加 deleted）----
 
     def test_init_db_migrates_legacy_segment_changes_check(self):
@@ -919,6 +1036,59 @@ class ServiceTestCase(unittest.TestCase):
             )
             w = svc.withdraw_event(c, source="s", event_id="only", silence=SILENCE)
         self.assertEqual(w["result"], "deleted_segment")
+
+    def test_init_db_adds_acknowledgements_table_to_legacy_volume(self):
+        # 模拟确认功能上线前的持久化卷：只有旧三表，无 segment_acknowledgements
+        import sqlite3
+
+        legacy = os.path.join(self.tmp.name, "legacy_ack.db")
+        conn = sqlite3.connect(legacy)
+        conn.executescript(
+            """
+            CREATE TABLE segments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL,
+                start_ts REAL NOT NULL, end_ts REAL NOT NULL,
+                max_severity TEXT NOT NULL, event_count INTEGER NOT NULL,
+                revision INTEGER NOT NULL,
+                created_at REAL NOT NULL, updated_at REAL NOT NULL);
+            CREATE TABLE events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                segment_id INTEGER NOT NULL REFERENCES segments (id),
+                source TEXT NOT NULL, event_id TEXT NOT NULL,
+                occurred_at REAL NOT NULL, severity TEXT NOT NULL,
+                received_at REAL NOT NULL, UNIQUE (source, event_id));
+            CREATE TABLE segment_changes (
+                change_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type TEXT NOT NULL CHECK (type IN ('upsert','merged')),
+                segment_id INTEGER NOT NULL, merged_into INTEGER, revision INTEGER,
+                source TEXT, start_ts REAL, end_ts REAL, max_severity TEXT,
+                event_count INTEGER, created_at REAL NOT NULL);
+            """
+        )
+        conn.execute(
+            "INSERT INTO segments (source, start_ts, end_ts, max_severity, "
+            "event_count, revision, created_at, updated_at) "
+            "VALUES ('s', 0, 0, 'info', 1, 1, 1, 1)"
+        )
+        conn.commit()
+        conn.close()
+
+        from app.db import init_db as _init
+
+        _init(legacy)  # 启动迁移：补齐新表
+        _init(legacy)  # 再次执行必须幂等
+
+        # 旧数据完整保留，确认流程在新表上正常工作
+        with session(legacy) as c:
+            c.execute("BEGIN IMMEDIATE")
+            r = service.acknowledge_segment(
+                c, segment_id=1, operator="ops", note="n",
+                expected_revision=1, idempotency_key="k1",
+            )
+        self.assertEqual(r["outcome"], "created")
+        with session(legacy) as c:
+            self.assertEqual(len(service.list_acknowledgements(c, 1)), 1)
+            self.assertIsNotNone(service.get_segment(c, 1))  # 旧段数据未受影响
 
 
 if __name__ == "__main__":

@@ -150,3 +150,35 @@ class ResegmentationPreviewResponse(BaseModel):
     simulated_segments: list[PreviewSegmentOut]
     mappings: list[SegmentMappingOut]
     summary: ResegmentationSummary
+
+
+class AcknowledgementIn(BaseModel):
+    """人工确认请求：校验 expected_revision 后追加不可变审计记录。
+
+    idempotency_key 在段内唯一：相同键 + 相同载荷重放返回原记录，
+    相同键 + 不同载荷返回 409。
+    """
+
+    operator: str = Field(min_length=1, max_length=256, examples=["ops-alice"])
+    note: str = Field(max_length=2000, examples=["已确认，通知值班处理"])
+    expected_revision: int = Field(ge=1, examples=[2])
+    idempotency_key: str = Field(
+        min_length=1, max_length=256, examples=["ack-20260921-0001"]
+    )
+
+
+class AcknowledgementOut(BaseModel):
+    """一条人工确认审计记录（不可变）；ack_id 为单调递增的确认序号。
+
+    segment_revision 为确认落库时刻段的实际 revision（与校验通过的
+    expected_revision 一致），此后段如何变化都不影响该记录。
+    """
+
+    ack_id: int
+    segment_id: int
+    operator: str
+    note: str
+    expected_revision: int
+    segment_revision: int
+    idempotency_key: str
+    created_at: datetime

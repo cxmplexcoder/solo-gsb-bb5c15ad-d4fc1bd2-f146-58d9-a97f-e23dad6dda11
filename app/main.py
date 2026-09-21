@@ -6,10 +6,13 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import JSONResponse
 
 from .config import Settings
 from .db import init_db, read_only_session, session
 from .schemas import (
+    AcknowledgementIn,
+    AcknowledgementOut,
     EventIn,
     EventsPage,
     IngestResponse,
@@ -33,7 +36,7 @@ def create_app(settings: Settings) -> FastAPI:
 
     app = FastAPI(
         title="设备告警事件段聚合服务",
-        version="1.2.0",
+        version="1.3.0",
         lifespan=lifespan,
     )
 
@@ -162,6 +165,70 @@ def create_app(settings: Settings) -> FastAPI:
         """列出事件段，可按 source 过滤。"""
         with session(settings.database_path) as conn:
             return service.list_segments(conn, source)
+
+    @app.post(
+        "/segments/{segment_id}/acknowledgements",
+        response_model=AcknowledgementOut,
+    )
+    def acknowledge_segment(segment_id: int, ack: AcknowledgementIn):
+        """人工确认审计：校验 expected_revision 后追加不可变确认记录。
+
+        - 在 BEGIN IMMEDIATE 事务内校验段当前 revision 后落库；
+          段不存在返回 404；
+        - expected_revision 与段当前 revision 不一致返回 409，
+          响应体携带当前段快照（{"detail": ..., "segment": {...}}）；
+        - idempotency_key 在段内幂等：相同键 + 相同载荷重放返回原记录
+          （即使段此后已变化），相同键 + 不同载荷返回 409；
+        - 确认记录仅追加、不可变，不改变段的 revision、不写变更流。
+        """
+        with _ingest_lock, session(settings.database_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            result = service.acknowledge_segment(
+                conn,
+                segment_id=segment_id,
+                operator=ack.operator,
+                note=ack.note,
+                expected_revision=ack.expected_revision,
+                idempotency_key=ack.idempotency_key,
+            )
+        outcome = result["outcome"]
+        if outcome == "not_found":
+            raise HTTPException(status_code=404, detail="segment not found")
+        if outcome == "revision_conflict":
+            segment = result["segment"]
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "detail": (
+                        f"expected_revision {ack.expected_revision} 与段当前 "
+                        f"revision {segment['revision']} 不一致"
+                    ),
+                    "segment": segment,
+                },
+            )
+        if outcome == "payload_conflict":
+            raise HTTPException(
+                status_code=409,
+                detail="idempotency_key 已被不同载荷使用",
+            )
+        return result["acknowledgement"]
+
+    @app.get(
+        "/segments/{segment_id}/acknowledgements",
+        response_model=list[AcknowledgementOut],
+    )
+    def list_acknowledgements(segment_id: int) -> list[dict]:
+        """按确认序号升序列出该段的人工确认记录；段不存在返回 404。"""
+        with read_only_session(settings.database_path) as conn:
+            segment = service.get_segment(conn, segment_id)
+            records = (
+                service.list_acknowledgements(conn, segment_id)
+                if segment is not None
+                else None
+            )
+        if segment is None:
+            raise HTTPException(status_code=404, detail="segment not found")
+        return records
 
     @app.get("/segment-changes", response_model=SegmentChangesPage)
     def list_segment_changes(

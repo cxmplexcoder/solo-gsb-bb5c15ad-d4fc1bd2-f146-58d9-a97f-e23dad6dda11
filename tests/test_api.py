@@ -653,3 +653,141 @@ def test_get_events_is_read_only(client):
         client.get("/events", params={"source": "gw-01"})
     assert client.get("/segments").json() == segs
     assert client.get("/segment-changes").json() == changes
+
+
+# ---- 人工确认审计 POST/GET /segments/{id}/acknowledgements ----
+
+def _ack(client, segment_id, *, operator="ops-alice", note="已确认",
+         expected_revision=1, key="ack-1"):
+    return client.post(f"/segments/{segment_id}/acknowledgements", json={
+        "operator": operator,
+        "note": note,
+        "expected_revision": expected_revision,
+        "idempotency_key": key,
+    })
+
+
+def test_acknowledge_segment_created(client):
+    seg = _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z", "warning")["segment"]
+    resp = _ack(client, seg["id"], operator="ops-alice", note="已确认，通知值班",
+                expected_revision=1, key="ack-0001")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ack_id"] == 1
+    assert body["segment_id"] == seg["id"]
+    assert body["operator"] == "ops-alice"
+    assert body["note"] == "已确认，通知值班"
+    assert body["expected_revision"] == 1
+    assert body["segment_revision"] == 1
+    assert body["idempotency_key"] == "ack-0001"
+    assert body["created_at"]
+
+    listed = client.get(f"/segments/{seg['id']}/acknowledgements")
+    assert listed.status_code == 200
+    assert listed.json() == [body]
+
+
+def test_acknowledge_revision_mismatch_409_with_segment_snapshot(client):
+    _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z")
+    seg = _post(client, "gw-01", "e2", "2026-09-20T08:00:30Z", "error")["segment"]
+    assert seg["revision"] == 2
+
+    resp = _ack(client, seg["id"], expected_revision=1, key="ack-1")
+    assert resp.status_code == 409
+    body = resp.json()
+    assert body["segment"]["id"] == seg["id"]
+    assert body["segment"]["revision"] == 2  # 携带当前段快照
+    assert body["segment"]["event_count"] == 2
+    # 冲突不落库；用正确 revision 重试同一键可成功（冲突不占用幂等键）
+    assert client.get(f"/segments/{seg['id']}/acknowledgements").json() == []
+    ok = _ack(client, seg["id"], expected_revision=2, key="ack-1")
+    assert ok.status_code == 200
+    assert ok.json()["segment_revision"] == 2
+
+
+def test_acknowledge_replay_same_payload_returns_original_record(client):
+    seg = _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z")["segment"]
+    first = _ack(client, seg["id"], expected_revision=1, key="ack-1")
+    assert first.status_code == 200
+
+    # 段随后变化：revision 升到 2，原 expected_revision 已过期
+    _post(client, "gw-01", "e2", "2026-09-20T08:00:30Z", "critical")
+    assert client.get(f"/segments/{seg['id']}").json()["revision"] == 2
+
+    replay = _ack(client, seg["id"], expected_revision=1, key="ack-1")
+    assert replay.status_code == 200
+    assert replay.json() == first.json()  # 原记录原样返回，即使段已变化
+    assert len(client.get(f"/segments/{seg['id']}/acknowledgements").json()) == 1
+
+
+def test_acknowledge_same_key_different_payload_409(client):
+    seg = _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z")["segment"]
+    assert _ack(client, seg["id"], key="ack-1").status_code == 200
+    # 任一载荷字段不同都视为不同载荷
+    assert _ack(client, seg["id"], key="ack-1", operator="ops-bob").status_code == 409
+    assert _ack(client, seg["id"], key="ack-1", note="另一条备注").status_code == 409
+    assert _ack(client, seg["id"], key="ack-1", expected_revision=2).status_code == 409
+    # 冲突不新增记录
+    assert len(client.get(f"/segments/{seg['id']}/acknowledgements").json()) == 1
+
+
+def test_acknowledge_key_scoped_per_segment(client):
+    a = _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z")["segment"]
+    b = _post(client, "gw-02", "e2", "2026-09-20T08:00:00Z")["segment"]
+    r1 = _ack(client, a["id"], key="shared-key")
+    r2 = _ack(client, b["id"], key="shared-key")  # 不同段复用同键互不干扰
+    assert r1.status_code == r2.status_code == 200
+    assert r1.json()["ack_id"] != r2.json()["ack_id"]
+
+
+def test_acknowledge_unknown_segment_404(client):
+    assert _ack(client, 9999).status_code == 404
+    assert client.get("/segments/9999/acknowledgements").status_code == 404
+
+
+def test_list_acknowledgements_ordered_by_ack_id(client):
+    seg = _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z")["segment"]
+    other = _post(client, "gw-02", "e2", "2026-09-20T08:00:00Z")["segment"]
+    _ack(client, seg["id"], key="k1")
+    _ack(client, other["id"], key="k2")  # 其他段的记录不出现
+    _ack(client, seg["id"], key="k3")
+    _ack(client, seg["id"], key="k2")
+    rows = client.get(f"/segments/{seg['id']}/acknowledgements").json()
+    assert [r["idempotency_key"] for r in rows] == ["k1", "k3", "k2"]
+    ids = [r["ack_id"] for r in rows]
+    assert ids == sorted(ids)
+
+
+def test_acknowledge_does_not_change_segment_or_change_stream(client):
+    seg = _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z")["segment"]
+    before_seg = client.get(f"/segments/{seg['id']}").json()
+    before_changes = client.get("/segment-changes").json()
+    _ack(client, seg["id"], key="ack-1")
+    assert client.get(f"/segments/{seg['id']}").json() == before_seg
+    assert client.get("/segment-changes").json() == before_changes
+
+
+def test_acknowledge_records_survive_segment_deletion(client):
+    seg = _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z")["segment"]
+    first = _ack(client, seg["id"], key="ack-1").json()
+    client.delete("/events/gw-01/e1")  # 唯一事件撤回 → 段被删除
+    assert client.get(f"/segments/{seg['id']}").status_code == 404
+    # 幂等重放仍返回原记录（查重先于段状态校验）
+    replay = _ack(client, seg["id"], key="ack-1")
+    assert replay.status_code == 200
+    assert replay.json() == first
+
+
+def test_acknowledge_param_validation(client):
+    seg = _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z")["segment"]
+    url = f"/segments/{seg['id']}/acknowledgements"
+    valid = {"operator": "ops", "note": "n",
+             "expected_revision": 1, "idempotency_key": "k"}
+    # 缺字段
+    for missing in valid:
+        payload = {k: v for k, v in valid.items() if k != missing}
+        assert client.post(url, json=payload).status_code == 422
+    # 空 operator / 空 idempotency_key / 非法 revision
+    assert client.post(url, json={**valid, "operator": ""}).status_code == 422
+    assert client.post(url, json={**valid, "idempotency_key": ""}).status_code == 422
+    assert client.post(url, json={**valid, "expected_revision": 0}).status_code == 422
