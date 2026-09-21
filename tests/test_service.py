@@ -920,6 +920,181 @@ class ServiceTestCase(unittest.TestCase):
             w = svc.withdraw_event(c, source="s", event_id="only", silence=SILENCE)
         self.assertEqual(w["result"], "deleted_segment")
 
+    # ---- 人工确认审计 ----
+
+    def _ack(self, segment_id, *, operator="op", note="n",
+             expected_revision=1, key="k1"):
+        with session(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            return service.create_acknowledgement(
+                conn,
+                segment_id=segment_id,
+                operator=operator,
+                note=note,
+                expected_revision=expected_revision,
+                idempotency_key=key,
+            )
+
+    def _list_acks(self, segment_id):
+        with session(self.db_path) as conn:
+            return service.list_acknowledgements(conn, segment_id)
+
+    def test_acknowledgement_append_and_list_order(self):
+        seg_id = self.submit("s1", "e1", 1000.0)["segment"]["id"]
+        ack1, created1 = self._ack(seg_id, key="k1")
+        ack2, created2 = self._ack(seg_id, key="k2")
+        self.assertTrue(created1 and created2)
+        self.assertEqual((ack1["seq"], ack2["seq"]), (1, 2))
+        self.assertEqual(ack1["acknowledged_revision"], 1)
+        acks = self._list_acks(seg_id)
+        self.assertEqual([a["seq"] for a in acks], [1, 2])
+        self.assertEqual(acks[0]["operator"], "op")
+        self.assertTrue(acks[0]["acknowledged_at"])
+
+    def test_acknowledgement_revision_conflict(self):
+        seg_id = self.submit("s1", "e1", 1000.0)["segment"]["id"]
+        self.submit("s1", "e2", 990.0)  # 起点扩展 → revision=2
+        with self.assertRaises(service.RevisionConflictError) as cm:
+            self._ack(seg_id, expected_revision=1, key="k1")
+        self.assertEqual(cm.exception.segment["revision"], 2)
+        # 冲突由调用方回滚后无记录残留
+        self.assertEqual(self._list_acks(seg_id), [])
+        # 以正确 revision 重试成功，seq 从 1 起
+        ack, created = self._ack(seg_id, expected_revision=2, key="k1")
+        self.assertTrue(created)
+        self.assertEqual(ack["seq"], 1)
+        self.assertEqual(ack["acknowledged_revision"], 2)
+
+    def test_acknowledgement_segment_not_found(self):
+        with self.assertRaises(service.SegmentNotFoundError):
+            self._ack(424242, key="k1")
+        self.assertIsNone(self._list_acks(424242))
+
+    def test_acknowledgement_idempotent_replay_same_payload(self):
+        seg_id = self.submit("s1", "e1", 1000.0)["segment"]["id"]
+        first, created = self._ack(seg_id, note="hi", key="k1")
+        self.assertTrue(created)
+        self.submit("s1", "e2", 990.0)  # revision 1 → 2
+        replay, replayed = self._ack(seg_id, note="hi", key="k1")
+        self.assertFalse(replayed)
+        self.assertEqual(replay, first)  # 即使段已变化也返回原记录
+        self.assertEqual(len(self._list_acks(seg_id)), 1)
+
+    def test_acknowledgement_same_key_different_payload(self):
+        seg_id = self.submit("s1", "e1", 1000.0)["segment"]["id"]
+        first, _ = self._ack(seg_id, note="first", operator="a", key="k1")
+        base = {"note": "first", "operator": "a", "expected_revision": 1, "key": "k1"}
+        for changed in (
+            {**base, "note": "second"},
+            {**base, "operator": "b"},
+            {**base, "expected_revision": 2},
+        ):
+            with self.assertRaises(service.IdempotencyConflictError) as cm:
+                self._ack(seg_id, **changed)
+            self.assertEqual(cm.exception.acknowledgement, first)
+        self.assertEqual(len(self._list_acks(seg_id)), 1)
+
+    def test_acknowledgement_seq_per_segment_independent(self):
+        s1 = self.submit("s1", "e1", 1000.0)["segment"]["id"]
+        s2 = self.submit("s2", "e1", 1000.0)["segment"]["id"]
+        a, _ = self._ack(s1, key="k")
+        b, _ = self._ack(s2, key="k")  # 同键不同段不冲突
+        self.assertEqual((a["segment_id"], a["seq"]), (s1, 1))
+        self.assertEqual((b["segment_id"], b["seq"]), (s2, 1))
+        self.assertNotEqual(a["ack_id"], b["ack_id"])
+
+    def test_acknowledgement_records_survive_segment_deletion(self):
+        seg_id = self.submit("s1", "e1", 1000.0)["segment"]["id"]
+        first, _ = self._ack(seg_id, key="k1")
+        self.withdraw("s1", "e1")  # 唯一事件撤回 → 段删除
+        self.assertIsNone(self.get(seg_id))
+        # 审计记录仍在库中（不加外键，段删除不级联）
+        import sqlite3
+
+        conn = sqlite3.connect(self.db_path)
+        try:
+            n = conn.execute(
+                "SELECT COUNT(*) FROM segment_acknowledgements WHERE segment_id = ?",
+                (seg_id,),
+            ).fetchone()[0]
+            self.assertEqual(n, 1)
+        finally:
+            conn.close()
+        # 同键同载荷重放仍返回原记录（不检查段存在性）
+        replay, replayed = self._ack(seg_id, key="k1")
+        self.assertFalse(replayed)
+        self.assertEqual(replay, first)
+
+    def test_init_db_upgrades_legacy_volume_with_ack_table(self):
+        """旧持久化卷（无 segment_acknowledgements 表）启动即自动补齐且数据保留。"""
+        import sqlite3
+
+        legacy = os.path.join(self.tmp.name, "legacy-ack.db")
+        conn = sqlite3.connect(legacy)
+        # 仅建旧版全部对象（确认功能上线前的 schema）
+        conn.executescript(
+            """
+            CREATE TABLE segments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL,
+                start_ts REAL NOT NULL, end_ts REAL NOT NULL, max_severity TEXT NOT NULL,
+                event_count INTEGER NOT NULL, revision INTEGER NOT NULL,
+                created_at REAL NOT NULL, updated_at REAL NOT NULL);
+            CREATE TABLE events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, segment_id INTEGER NOT NULL,
+                source TEXT NOT NULL, event_id TEXT NOT NULL, occurred_at REAL NOT NULL,
+                severity TEXT NOT NULL, received_at REAL NOT NULL,
+                UNIQUE (source, event_id));
+            CREATE TABLE segment_changes (
+                change_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type TEXT NOT NULL CHECK (type IN ('upsert','merged','deleted')),
+                segment_id INTEGER NOT NULL, merged_into INTEGER, revision INTEGER,
+                source TEXT, start_ts REAL, end_ts REAL, max_severity TEXT,
+                event_count INTEGER, created_at REAL NOT NULL);
+            INSERT INTO segments
+                (id, source, start_ts, end_ts, max_severity, event_count,
+                 revision, created_at, updated_at)
+            VALUES (3, 's', 1000, 1000, 'info', 1, 1, 1, 1);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        from app.db import init_db as _init
+
+        _init(legacy)  # 启动升级
+        _init(legacy)  # 幂等
+
+        # 历史数据原样保留
+        conn = sqlite3.connect(legacy)
+        try:
+            row = conn.execute(
+                "SELECT id, source, revision FROM segments WHERE id = 3"
+            ).fetchone()
+            self.assertEqual(tuple(row), (3, "s", 1))
+            cols = {
+                r[1] for r in conn.execute("PRAGMA table_info(segment_acknowledgements)")
+            }
+            self.assertEqual(
+                cols,
+                {
+                    "ack_id", "segment_id", "seq", "operator", "note",
+                    "expected_revision", "acknowledged_revision",
+                    "idempotency_key", "created_at",
+                },
+            )
+        finally:
+            conn.close()
+
+        # 升级后的库可直接完成确认流程
+        with session(legacy) as c:
+            c.execute("BEGIN IMMEDIATE")
+            ack, created = service.create_acknowledgement(
+                c, segment_id=3, operator="op", note="ok",
+                expected_revision=1, idempotency_key="k1",
+            )
+        self.assertTrue(created)
+        self.assertEqual(ack["seq"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

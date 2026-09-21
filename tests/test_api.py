@@ -653,3 +653,210 @@ def test_get_events_is_read_only(client):
         client.get("/events", params={"source": "gw-01"})
     assert client.get("/segments").json() == segs
     assert client.get("/segment-changes").json() == changes
+
+
+# ---- 人工确认审计 POST/GET /segments/{id}/acknowledgements ----
+
+def _ack_payload(
+    operator="ops-oncall-01",
+    note="已电话联系现场确认",
+    expected_revision=1,
+    idempotency_key="ack-0001",
+):
+    return {
+        "operator": operator,
+        "note": note,
+        "expected_revision": expected_revision,
+        "idempotency_key": idempotency_key,
+    }
+
+
+def test_acknowledge_segment_creates_immutable_record(client):
+    seg = _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z", "critical")["segment"]
+    resp = client.post(
+        f"/segments/{seg['id']}/acknowledgements", json=_ack_payload()
+    )
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["replayed"] is False
+    ack = body["acknowledgement"]
+    assert set(ack) == {
+        "ack_id", "segment_id", "seq", "operator", "note",
+        "expected_revision", "acknowledged_revision",
+        "idempotency_key", "acknowledged_at",
+    }
+    assert ack["segment_id"] == seg["id"]
+    assert ack["seq"] == 1
+    assert ack["operator"] == "ops-oncall-01"
+    assert ack["note"] == "已电话联系现场确认"
+    assert ack["expected_revision"] == 1
+    assert ack["acknowledged_revision"] == 1
+    assert ack["idempotency_key"] == "ack-0001"
+    assert ack["acknowledged_at"]
+
+    # 确认不改段本身：revision / 计数不变
+    assert client.get(f"/segments/{seg['id']}").json() == seg
+
+    listing = client.get(f"/segments/{seg['id']}/acknowledgements").json()
+    assert listing == {"segment_id": seg["id"], "acknowledgements": [ack]}
+
+
+def test_acknowledgement_seq_increments_per_segment(client):
+    s1 = _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z")["segment"]
+    s2 = _post(client, "gw-02", "e1", "2026-09-20T08:00:00Z")["segment"]  # 另一段
+
+    def add(seg_id, key):
+        return client.post(
+            f"/segments/{seg_id}/acknowledgements",
+            json=_ack_payload(expected_revision=1, idempotency_key=key),
+        )
+
+    a1 = add(s1["id"], "k1").json()["acknowledgement"]
+    b1 = add(s2["id"], "k1").json()["acknowledgement"]  # 同键不同段互不影响
+    a2 = add(s1["id"], "k2").json()["acknowledgement"]
+
+    assert [a1["seq"], a2["seq"]] == [1, 2]  # 段内独立计数
+    assert b1["seq"] == 1
+    assert a1["ack_id"] != b1["ack_id"]  # ack_id 全局唯一
+    # 列表严格按 seq 升序
+    l1 = client.get(f"/segments/{s1['id']}/acknowledgements").json()
+    assert [a["seq"] for a in l1["acknowledgements"]] == [1, 2]
+
+
+def test_acknowledgement_revision_conflict_returns_snapshot(client):
+    seg = _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z", "info")["segment"]
+    # 08:00:30 在静默窗口内扩展结束边界 → revision 变为 2
+    _post(client, "gw-01", "e2", "2026-09-20T08:00:30Z", "error")
+
+    resp = client.post(
+        f"/segments/{seg['id']}/acknowledgements",
+        json=_ack_payload(expected_revision=1),
+    )
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["error"] == "revision_mismatch"
+    assert detail["expected_revision"] == 1
+    assert detail["current_segment"]["revision"] == 2
+    assert detail["current_segment"]["id"] == seg["id"]
+    assert detail["current_segment"]["event_count"] == 2
+    # 冲突不产生任何确认记录
+    listing = client.get(f"/segments/{seg['id']}/acknowledgements").json()
+    assert listing["acknowledgements"] == []
+
+    # 以当前 revision 与新幂等键重试 → 成功，seq 从 1 起（此前无落库记录）
+    ok = client.post(
+        f"/segments/{seg['id']}/acknowledgements",
+        json=_ack_payload(expected_revision=2, idempotency_key="ack-0002"),
+    )
+    assert ok.status_code == 201
+    assert ok.json()["acknowledgement"]["seq"] == 1
+    assert ok.json()["acknowledgement"]["acknowledged_revision"] == 2
+
+
+def test_acknowledgement_replay_returns_original_after_segment_changes(client):
+    seg = _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z")["segment"]
+    payload = _ack_payload(expected_revision=1)
+    first = client.post(f"/segments/{seg['id']}/acknowledgements", json=payload)
+    assert first.status_code == 201
+    original = first.json()["acknowledgement"]
+
+    # 段随后发生变化（08:00:30 在 60s 窗口内扩展边界，revision 1 → 2）
+    _post(client, "gw-01", "e2", "2026-09-20T08:00:30Z", "error")
+
+    # 同键同载荷重放：200 + replayed，仍返回原记录，不追加
+    replay = client.post(f"/segments/{seg['id']}/acknowledgements", json=payload)
+    assert replay.status_code == 200
+    body = replay.json()
+    assert body["replayed"] is True
+    assert body["acknowledgement"] == original
+
+    listing = client.get(f"/segments/{seg['id']}/acknowledgements").json()
+    assert len(listing["acknowledgements"]) == 1
+    assert listing["acknowledgements"][0] == original
+
+
+def test_acknowledgement_replay_works_even_after_segment_deleted(client):
+    seg = _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z")["segment"]
+    payload = _ack_payload(expected_revision=1)
+    original = client.post(
+        f"/segments/{seg['id']}/acknowledgements", json=payload
+    ).json()["acknowledgement"]
+
+    # 撤回唯一事件 → 段被删除
+    assert client.delete("/events/gw-01/e1").status_code == 200
+    assert client.get(f"/segments/{seg['id']}").status_code == 404
+    # GET 列表对已消失段返回 404
+    assert client.get(
+        f"/segments/{seg['id']}/acknowledgements"
+    ).status_code == 404
+
+    # 同键同载荷重放：审计原记录仍原样返回（200），不重新校验段存在性
+    replay = client.post(
+        f"/segments/{seg['id']}/acknowledgements", json=payload
+    )
+    assert replay.status_code == 200
+    assert replay.json()["replayed"] is True
+    assert replay.json()["acknowledgement"] == original
+
+
+def test_acknowledgement_same_key_different_payload_conflicts(client):
+    seg = _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z")["segment"]
+    original = client.post(
+        f"/segments/{seg['id']}/acknowledgements", json=_ack_payload(note="原始备注")
+    ).json()["acknowledgement"]
+
+    for changed in (
+        _ack_payload(note="不同备注"),
+        _ack_payload(operator="someone-else"),
+        _ack_payload(expected_revision=2),
+    ):
+        resp = client.post(
+            f"/segments/{seg['id']}/acknowledgements", json=changed
+        )
+        assert resp.status_code == 409
+        body = resp.json()
+        assert body["replayed"] is True
+        assert body["error"] == "idempotency_key_payload_mismatch"
+        assert body["acknowledgement"] == original  # 原记录不可变
+
+    # 载荷冲突不追加任何新记录；同键同载荷仍可正常重放
+    assert client.post(
+        f"/segments/{seg['id']}/acknowledgements", json=_ack_payload(note="原始备注")
+    ).status_code == 200
+    listing = client.get(f"/segments/{seg['id']}/acknowledgements").json()
+    assert len(listing["acknowledgements"]) == 1
+
+
+def test_acknowledgement_unknown_segment_404(client):
+    resp = client.post(
+        "/segments/9999/acknowledgements", json=_ack_payload()
+    )
+    assert resp.status_code == 404
+    assert client.get("/segments/9999/acknowledgements").status_code == 404
+
+
+def test_list_acknowledgements_empty_for_existing_segment(client):
+    seg = _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z")["segment"]
+    assert client.get(
+        f"/segments/{seg['id']}/acknowledgements"
+    ).json() == {"segment_id": seg["id"], "acknowledgements": []}
+
+
+def test_acknowledgement_payload_validation(client):
+    seg = _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z")["segment"]
+    url = f"/segments/{seg['id']}/acknowledgements"
+
+    def expect_422(payload):
+        assert client.post(url, json=payload).status_code == 422
+
+    expect_422({})  # 缺全部字段
+    expect_422(_ack_payload(operator=""))  # 空 operator
+    expect_422(_ack_payload(note=""))  # 空 note
+    expect_422(_ack_payload(idempotency_key=""))  # 空幂等键
+    expect_422(_ack_payload(expected_revision=0))  # revision 必须 >= 1
+    expect_422(_ack_payload(expected_revision=-1))
+    expect_422(_ack_payload(operator="o" * 257))  # 超长
+    # 路径段 id 非数字不会误匹配
+    assert client.post(
+        "/segments/not-an-int/acknowledgements", json=_ack_payload()
+    ).status_code == 422

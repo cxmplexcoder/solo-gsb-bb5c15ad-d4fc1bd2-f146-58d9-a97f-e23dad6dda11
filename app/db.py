@@ -48,6 +48,23 @@ CREATE TABLE IF NOT EXISTS segment_changes (
     created_at   REAL    NOT NULL
 );
 -- 查询模式为 WHERE change_id > ? ORDER BY change_id，主键即索引，无需额外索引
+
+-- 段人工确认审计：只追加（INSERT），不提供任何 UPDATE/DELETE 路径。
+-- segment_id 不加外键：段事后被合并或撤回删除后，历史确认记录仍须保留可查。
+-- (segment_id, seq) 唯一索引同时覆盖 WHERE segment_id = ? ORDER BY seq 的列表查询。
+CREATE TABLE IF NOT EXISTS segment_acknowledgements (
+    ack_id                INTEGER PRIMARY KEY AUTOINCREMENT,  -- 全局内部主键（单调递增）
+    segment_id            INTEGER NOT NULL,   -- 被确认段 id（不加 REFERENCES，容许段消失）
+    seq                   INTEGER NOT NULL,   -- 段内确认序号，从 1 起，按段独立计数
+    operator              TEXT    NOT NULL,
+    note                  TEXT    NOT NULL,
+    expected_revision     INTEGER NOT NULL,   -- 操作员提交时断言的段 revision（乐观锁）
+    acknowledged_revision INTEGER NOT NULL,   -- 校验通过时段的实际 revision（审计快照）
+    idempotency_key       TEXT    NOT NULL,
+    created_at            REAL    NOT NULL,
+    UNIQUE (segment_id, seq),
+    UNIQUE (segment_id, idempotency_key)      -- 同段幂等重放 / 载荷冲突检测
+);
 """
 
 
@@ -79,7 +96,11 @@ def _migrate_segment_changes(conn: sqlite3.Connection) -> None:
 
 
 def init_db(db_path: str) -> None:
-    """建表并执行幂等迁移；Docker 启动时即完成数据库初始化。"""
+    """建表并执行幂等迁移；Docker 启动时即完成数据库初始化。
+
+    全部建表均为 CREATE TABLE IF NOT EXISTS，挂在已有持久化卷上的旧库启动后
+    自动补齐新表（如 segment_acknowledgements），历史数据原样保留。
+    """
     with connect(db_path) as conn:
         conn.executescript(SCHEMA)
         _migrate_segment_changes(conn)

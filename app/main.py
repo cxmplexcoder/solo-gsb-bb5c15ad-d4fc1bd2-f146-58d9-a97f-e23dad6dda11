@@ -5,11 +5,14 @@ import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Response
 
 from .config import Settings
 from .db import init_db, read_only_session, session
 from .schemas import (
+    AcknowledgementIn,
+    AcknowledgementResult,
+    AcknowledgementsPage,
     EventIn,
     EventsPage,
     IngestResponse,
@@ -21,8 +24,9 @@ from .schemas import (
 from . import service
 from . import severity as sev
 
-# SQLite 单写者：进程内串行化归段写入（含撤回），配合事务保证合并/拆段一致性
-_ingest_lock = threading.Lock()
+# SQLite 单写者：进程内串行化所有写事务（归段/撤回/人工确认），
+# 配合 BEGIN IMMEDIATE 保证合并、拆段与确认追加的一致性
+_write_lock = threading.Lock()
 
 
 def create_app(settings: Settings) -> FastAPI:
@@ -33,7 +37,7 @@ def create_app(settings: Settings) -> FastAPI:
 
     app = FastAPI(
         title="设备告警事件段聚合服务",
-        version="1.2.0",
+        version="1.3.0",
         lifespan=lifespan,
     )
 
@@ -95,7 +99,7 @@ def create_app(settings: Settings) -> FastAPI:
     @app.post("/events", response_model=IngestResponse)
     def submit_event(event: EventIn) -> dict:
         """提交告警事件；按 source + 静默间隔归段，event_id 幂等去重。"""
-        with _ingest_lock, session(settings.database_path) as conn:
+        with _write_lock, session(settings.database_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             return service.ingest_event(
                 conn,
@@ -117,7 +121,7 @@ def create_app(settings: Settings) -> FastAPI:
         - 未拆段 → 保留原 id，边界/最高级别重算，revision+1，upsert；
         - 任一步失败整体回滚，事件、段与变更流均保持撤回前状态。
         """
-        with _ingest_lock, session(settings.database_path) as conn:
+        with _write_lock, session(settings.database_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             result = service.withdraw_event(
                 conn,
@@ -156,6 +160,76 @@ def create_app(settings: Settings) -> FastAPI:
         if segment is None:
             raise HTTPException(status_code=404, detail="segment not found")
         return segment
+
+    @app.post(
+        "/segments/{segment_id}/acknowledgements",
+        response_model=AcknowledgementResult,
+        status_code=201,
+    )
+    def acknowledge_segment(
+        segment_id: int, payload: AcknowledgementIn, response: Response
+    ) -> dict:
+        """对事件段追加一条不可变的人工确认记录（乐观锁 + 幂等）。
+
+        - 整个判定与追加在单个 ``BEGIN IMMEDIATE`` 事务内完成：先查同段
+          ``idempotency_key``，键未命中才校验段存在性与 ``expected_revision``；
+        - 段不存在返回 404；``expected_revision`` 与段当前 revision 不符返回
+          409，响应体携带 ``current_segment`` 当前快照供客户端刷新后重试；
+        - 同一 ``idempotency_key`` 且载荷（operator/note/expected_revision）
+          完全相同 → 返回原记录（200，``replayed: true``），**即使段此后已变化
+          甚至已被删除**；同键但载荷不同 → 409（``replayed: true``，携带原记录）；
+        - 确认只追加、不修改段本身，revision 不因确认而变化。
+        """
+        with _write_lock, session(settings.database_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                acknowledgement, created = service.create_acknowledgement(
+                    conn,
+                    segment_id=segment_id,
+                    operator=payload.operator,
+                    note=payload.note,
+                    expected_revision=payload.expected_revision,
+                    idempotency_key=payload.idempotency_key,
+                )
+            except service.SegmentNotFoundError as exc:
+                raise HTTPException(
+                    status_code=404, detail="segment not found"
+                ) from exc
+            except service.RevisionConflictError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "revision_mismatch",
+                        "message": (
+                            f"expected_revision {payload.expected_revision} 与段当前 "
+                            f"revision {exc.segment['revision']} 不一致"
+                        ),
+                        "expected_revision": payload.expected_revision,
+                        "current_segment": exc.segment,
+                    },
+                ) from exc
+            except service.IdempotencyConflictError as exc:
+                response.status_code = 409
+                return {
+                    "replayed": True,
+                    "error": "idempotency_key_payload_mismatch",
+                    "acknowledgement": exc.acknowledgement,
+                }
+        if not created:
+            response.status_code = 200
+        return {"replayed": not created, "acknowledgement": acknowledgement}
+
+    @app.get(
+        "/segments/{segment_id}/acknowledgements",
+        response_model=AcknowledgementsPage,
+    )
+    def list_acknowledgements(segment_id: int) -> dict:
+        """列出段的全部人工确认记录，按段内确认序号 seq 升序；段不存在返回 404。"""
+        with session(settings.database_path) as conn:
+            acknowledgements = service.list_acknowledgements(conn, segment_id)
+        if acknowledgements is None:
+            raise HTTPException(status_code=404, detail="segment not found")
+        return {"segment_id": segment_id, "acknowledgements": acknowledgements}
 
     @app.get("/segments", response_model=list[SegmentOut])
     def list_segments(source: str | None = Query(default=None)) -> list[dict]:

@@ -33,6 +33,15 @@
   支持 source 必填、起止时间与 severity 多值过滤；
 - 键集分页游标 after/next_after 为不透明字符串，编码上一页末行的
   (occurred_at, event_id) 复合位置；空页回显入参 after，游标保持不变。
+
+人工确认审计（create_acknowledgement / list_acknowledgements）：
+- 调用方在 BEGIN IMMEDIATE 事务内调用；先按 (segment_id, idempotency_key)
+  查已有记录：键命中则与本次载荷（operator/note/expected_revision）逐字比较，
+  相同即幂等重放原记录（created=False），即使段此后 revision 已变甚至已被删除；
+  载荷不同抛 IdempotencyConflictError；
+- 键未命中时读取段：不存在抛 SegmentNotFoundError（回 404）；段当前 revision
+  与 expected_revision 不符抛 RevisionConflictError（回 409 并携带当前快照）；
+- 校验通过后以该段 seq 最大值 +1 追加一条只增记录，全部写操作在同一事务内。
 """
 from __future__ import annotations
 
@@ -44,6 +53,29 @@ import time
 from datetime import datetime, timezone
 
 from . import severity as sev
+
+
+class SegmentNotFoundError(LookupError):
+    """段不存在（已删除或从未创建）；调用方回 404。"""
+
+
+class RevisionConflictError(Exception):
+    """expected_revision 与段当前 revision 不符；调用方回 409 并携带段快照。"""
+
+    def __init__(self, segment: dict):
+        self.segment = segment
+        super().__init__(f"revision conflict on segment {segment['id']}")
+
+
+class IdempotencyConflictError(Exception):
+    """同一幂等键对应不同载荷；调用方回 409 并携带已存在的原记录。"""
+
+    def __init__(self, acknowledgement: dict):
+        self.acknowledgement = acknowledgement
+        super().__init__(
+            f"idempotency key {acknowledgement['idempotency_key']!r} reused "
+            f"with a different payload"
+        )
 
 
 def _iso(ts: float) -> str:
@@ -670,3 +702,104 @@ def withdraw_event(
         "result": result,
         "segments": result_segments,
     }
+
+
+# ---- 人工确认审计（不可变、只追加）----
+
+def _row_to_acknowledgement(row: sqlite3.Row) -> dict:
+    return {
+        "ack_id": row["ack_id"],
+        "segment_id": row["segment_id"],
+        "seq": row["seq"],
+        "operator": row["operator"],
+        "note": row["note"],
+        "expected_revision": row["expected_revision"],
+        "acknowledged_revision": row["acknowledged_revision"],
+        "idempotency_key": row["idempotency_key"],
+        "acknowledged_at": _iso(row["created_at"]),
+    }
+
+
+def create_acknowledgement(
+    conn: sqlite3.Connection,
+    *,
+    segment_id: int,
+    operator: str,
+    note: str,
+    expected_revision: int,
+    idempotency_key: str,
+) -> tuple[dict, bool]:
+    """在调用方的写事务（BEGIN IMMEDIATE）内追加一条段确认记录。
+
+    返回 (acknowledgement, created)：created=True 为新记录，False 为同键同载荷
+    的幂等重放（原样返回已存在记录，不追加、不重新校验 revision）。
+
+    - 幂等键按 (segment_id, idempotency_key) 唯一定位，重放先于 revision 校验：
+      即使段已被后续事件/撤回改动，同键同载荷仍返回原记录；
+    - 同键但 operator/note/expected_revision 任一不同 → IdempotencyConflictError；
+    - 键未命中且段不存在 → SegmentNotFoundError（含段已被删除/合并的情形）；
+    - 段当前 revision != expected_revision → RevisionConflictError（携带当前快照）。
+    """
+    existing = conn.execute(
+        """
+        SELECT * FROM segment_acknowledgements
+        WHERE segment_id = ? AND idempotency_key = ?
+        """,
+        (segment_id, idempotency_key),
+    ).fetchone()
+    if existing is not None:
+        if (
+            existing["operator"] == operator
+            and existing["note"] == note
+            and existing["expected_revision"] == expected_revision
+        ):
+            return _row_to_acknowledgement(existing), False
+        raise IdempotencyConflictError(_row_to_acknowledgement(existing))
+
+    segment = get_segment(conn, segment_id)
+    if segment is None:
+        raise SegmentNotFoundError(segment_id)
+    if segment["revision"] != expected_revision:
+        raise RevisionConflictError(segment)
+
+    row = conn.execute(
+        "SELECT COALESCE(MAX(seq), 0) AS max_seq "
+        "FROM segment_acknowledgements WHERE segment_id = ?",
+        (segment_id,),
+    ).fetchone()
+    seq = row["max_seq"] + 1
+    now = time.time()
+    cur = conn.execute(
+        """
+        INSERT INTO segment_acknowledgements
+            (segment_id, seq, operator, note, expected_revision,
+             acknowledged_revision, idempotency_key, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            segment_id, seq, operator, note, expected_revision,
+            segment["revision"], idempotency_key, now,
+        ),
+    )
+    inserted = conn.execute(
+        "SELECT * FROM segment_acknowledgements WHERE ack_id = ?",
+        (cur.lastrowid,),
+    ).fetchone()
+    return _row_to_acknowledgement(inserted), True
+
+
+def list_acknowledgements(
+    conn: sqlite3.Connection, segment_id: int
+) -> list[dict] | None:
+    """按段内确认序号 seq 升序列出确认记录；段不存在返回 None（调用方回 404）。"""
+    if get_segment(conn, segment_id) is None:
+        return None
+    rows = conn.execute(
+        """
+        SELECT * FROM segment_acknowledgements
+        WHERE segment_id = ?
+        ORDER BY seq
+        """,
+        (segment_id,),
+    ).fetchall()
+    return [_row_to_acknowledgement(r) for r in rows]

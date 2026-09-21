@@ -150,3 +150,58 @@ class ResegmentationPreviewResponse(BaseModel):
     simulated_segments: list[PreviewSegmentOut]
     mappings: list[SegmentMappingOut]
     summary: ResegmentationSummary
+
+
+class AcknowledgementIn(BaseModel):
+    """段人工确认请求（乐观锁 + 幂等）。"""
+
+    operator: str = Field(
+        min_length=1, max_length=256, examples=["ops-oncall-01"]
+    )
+    note: str = Field(
+        min_length=1, max_length=4096, examples=["已电话联系现场确认，重启处理中"]
+    )
+    expected_revision: int = Field(
+        ge=1, examples=[2], description="客户端读取段时持有的 revision"
+    )
+    idempotency_key: str = Field(
+        min_length=1, max_length=512, examples=["ack-20260920-0001"]
+    )
+
+
+class AcknowledgementOut(BaseModel):
+    """一条不可变的人工确认记录。
+
+    seq 为段内确认序号（从 1 起、按段独立）；expected_revision 是操作员断言
+    的 revision，acknowledged_revision 是确认落库时段的实际 revision（校验通过时
+    二者相等）；idempotency_key 重放同一请求时返回的仍是同一条记录。
+    """
+
+    ack_id: int
+    segment_id: int
+    seq: int
+    operator: str
+    note: str
+    expected_revision: int
+    acknowledged_revision: int
+    idempotency_key: str
+    acknowledged_at: datetime
+
+
+class AcknowledgementsPage(BaseModel):
+    """段确认记录列表：按确认序号 seq 升序。"""
+
+    segment_id: int
+    acknowledgements: list[AcknowledgementOut]
+
+
+class AcknowledgementResult(BaseModel):
+    """POST 确认结果：replayed=False 为新建（201），True 为幂等重放（200/409）。
+
+    同幂等键但载荷不同时 HTTP 状态码为 409，error 标明冲突类型，
+    acknowledgement 为已落库的原记录（不可变，绝不覆盖）。
+    """
+
+    replayed: bool
+    error: str | None = None
+    acknowledgement: AcknowledgementOut

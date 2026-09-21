@@ -1,6 +1,6 @@
 # 设备告警事件段聚合服务
 
-基于 FastAPI + SQLite 的告警汇聚服务：客户端上报离散告警事件，服务按 **source + 可配置静默间隔** 将乱序到达的事件归入同一事件段（segment），并保证 **event_id 幂等去重**——重复提交不改变任何计数。误报事件可通过 `DELETE /events/{source}/{event_id}` 撤回，服务在单事务内删除事件并按静默间隔重算其原段（删除/收缩/拆分）。`GET /events` 提供事件审计查询：在单一只读快照内按 `(occurred_at, event_id)` 稳定排序、支持时间窗与 severity 多值过滤及游标分页。每次段变更都会同事务写入**单调递增的变更流**，下游可通过 `GET /segment-changes` 做增量同步。
+基于 FastAPI + SQLite 的告警汇聚服务：客户端上报离散告警事件，服务按 **source + 可配置静默间隔** 将乱序到达的事件归入同一事件段（segment），并保证 **event_id 幂等去重**——重复提交不改变任何计数。误报事件可通过 `DELETE /events/{source}/{event_id}` 撤回，服务在单事务内删除事件并按静默间隔重算其原段（删除/收缩/拆分）。`GET /events` 提供事件审计查询：在单一只读快照内按 `(occurred_at, event_id)` 稳定排序、支持时间窗与 severity 多值过滤及游标分页。每次段变更都会同事务写入**单调递增的变更流**，下游可通过 `GET /segment-changes` 做增量同步。运维人员还可通过 `POST /segments/{id}/acknowledgements` 对段追加**不可变的人工确认审计记录**（revision 乐观锁 + 幂等键），并通过 `GET /segments/{id}/acknowledgements` 按确认序号升序查询。
 
 ## 快速开始
 
@@ -12,7 +12,7 @@ docker compose up --build
 
 服务地址：**http://localhost:8000**（交互式 API 文档：http://localhost:8000/docs）
 
-数据库文件在首次启动时自动建表初始化，并通过命名卷 `alerts-data` 持久化。
+数据库文件在首次启动时自动建表初始化，并通过命名卷 `alerts-data` 持久化。升级新版本时，新增表（如人工确认审计表）会在启动阶段以 `CREATE TABLE IF NOT EXISTS` 幂等补齐，**已有持久化卷上的历史数据原样保留**，无需手动迁移。
 
 ## 配置项
 
@@ -132,6 +132,120 @@ curl http://localhost:8000/segments/1
 curl 'http://localhost:8000/segments?source=edge-gateway-01'
 ```
 
+### 人工确认事件段 `POST /segments/{id}/acknowledgements`
+
+值班人员确认某事件段后，服务追加一条**不可变的确认审计记录**（只增、不提供修改/删除）。请求在单个 `BEGIN IMMEDIATE` 写事务内完成「幂等键检查 → 段存在性检查 → revision 乐观锁校验 → 追加记录」，保证并发确认与事件归段/撤回互不踩踏。
+
+```bash
+curl -X POST http://localhost:8000/segments/1/acknowledgements \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "operator": "ops-oncall-01",
+    "note": "已电话联系现场确认，正在重启网关联调",
+    "expected_revision": 2,
+    "idempotency_key": "ack-20260920-0001"
+  }'
+```
+
+请求字段：
+
+| 字段 | 必填 | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `operator` | 是 | 1–256 字符 | 操作员标识（人工账号/工号） |
+| `note` | 是 | 1–4096 字符 | 确认备注（处置说明、工单号等） |
+| `expected_revision` | 是 | 整数 ≥ 1 | 客户端读取段时持有的 `revision`，用于乐观并发控制 |
+| `idempotency_key` | 是 | 1–512 字符 | 客户端生成的幂等键；作用域为**单个段**（同键不同段互不影响） |
+
+成功追加（HTTP `201`）：
+
+```json
+{
+  "replayed": false,
+  "acknowledgement": {
+    "ack_id": 1,
+    "segment_id": 1,
+    "seq": 1,
+    "operator": "ops-oncall-01",
+    "note": "已电话联系现场确认，正在重启网关联调",
+    "expected_revision": 2,
+    "acknowledged_revision": 2,
+    "idempotency_key": "ack-20260920-0001",
+    "acknowledged_at": "2026-09-21T01:10:00+00:00"
+  }
+}
+```
+
+- **`seq`（确认序号）**：段内从 1 起独立计数、严格递增；`ack_id` 为全局内部主键。
+- **`expected_revision` / `acknowledged_revision`**：前者是操作员提交时断言的版本，后者是落库时段的实际版本（校验通过时二者相同），一并留存以便审计"确认时看到的是哪一版"。
+- 确认**不修改段本身**：段的计数、边界与 `revision` 都不因确认而变化。
+
+**revision 不匹配（HTTP `409`）**：段在客户端读取后被新事件扩展、合并或撤回重算过，当前 `revision` 与 `expected_revision` 不一致。响应体携带段当前快照，客户端可展示差异后以新 revision 重试（需使用**新的幂等键**）：
+
+```json
+{
+  "detail": {
+    "error": "revision_mismatch",
+    "message": "expected_revision 2 与段当前 revision 3 不一致",
+    "expected_revision": 2,
+    "current_segment": {
+      "id": 1,
+      "source": "edge-gateway-01",
+      "started_at": "2026-09-20T08:00:00+00:00",
+      "ended_at": "2026-09-20T08:11:40+00:00",
+      "max_severity": "critical",
+      "event_count": 5,
+      "revision": 3
+    }
+  }
+}
+```
+
+**幂等重放**：网络超时/客户端重试时，以**相同的幂等键与完全相同的载荷**（`operator`、`note`、`expected_revision` 三者逐字一致）重放，返回**最初那条原记录**（HTTP `200`，`replayed: true`），不会追加新记录、不会重新校验 revision——即使段在此期间已被改动（甚至该确认之后段已被撤回删除/合并），原记录仍原样返回。
+
+**同键不同载荷（HTTP `409`）**：幂等键被复用于内容不同的请求（防止误把同一键当随机串），返回已存在的原记录，原记录保持不可变：
+
+```json
+{
+  "replayed": true,
+  "error": "idempotency_key_payload_mismatch",
+  "acknowledgement": { "…": "已落库的原记录" }
+}
+```
+
+- 段不存在（从未创建或已被撤回删除/合并消失）返回 `404`；字段校验失败（缺字段、空字符串、`expected_revision < 1` 等）返回 `422`。
+- 幂等键冲突检测优先于 revision 校验：同键重放不同载荷时一律 409，与段当前 revision 无关。
+- 段事后被合并或撤回删除，其历史确认记录**仍保留**（审计记录不随段删除），但因其段已不存在，不再能通过该段的列表接口读取，也不能再对其追加确认（404）。
+
+### 查询确认记录 `GET /segments/{id}/acknowledgements`
+
+按段内确认序号 `seq` **升序**返回某段的全部人工确认记录：
+
+```bash
+curl http://localhost:8000/segments/1/acknowledgements
+```
+
+```json
+{
+  "segment_id": 1,
+  "acknowledgements": [
+    {
+      "ack_id": 1,
+      "segment_id": 1,
+      "seq": 1,
+      "operator": "ops-oncall-01",
+      "note": "已电话联系现场确认，正在重启网关联调",
+      "expected_revision": 2,
+      "acknowledged_revision": 2,
+      "idempotency_key": "ack-20260920-0001",
+      "acknowledged_at": "2026-09-21T01:10:00+00:00"
+    }
+  ]
+}
+```
+
+- 尚无确认记录的存在段返回 `{"segment_id": 1, "acknowledgements": []}`；段不存在返回 `404`。
+- 记录只追加、永不修改，列表即该段完整的人工确认审计轨迹。
+
 ### 静默间隔重分段预演 `GET /segments/resegmentation-preview`
 
 用**候选静默间隔**对某来源的全部原始事件重新归段，预览"如果改了间隔会变成什么样"。全程**只读**：在同一只读事务（`query_only` 连接）内读取该来源全部事件并按 `occurred_at`、`event_id` 稳定排序后重算，**不会改写事件、现有段或变更流**；模拟段仅以本次响应内有效的临时编号 `temp_id` 标识。
@@ -248,6 +362,7 @@ curl 'http://localhost:8000/segment-changes?after=0&limit=100'
 - `(source, event_id)` 唯一约束保证幂等：重复提交直接返回原段，不改计数、不改 revision。
 - **误报撤回**（`DELETE /events/{source}/{event_id}`）在单事务内删除事件并对原段剩余事件重新切分：无剩余事件则删段（`deleted` 墓碑）；未拆段则沿用原 id 且 `revision` +1；拆段时最早子段沿用原 id（`revision` +1）、其余子段新建（`revision=1`）。
 - 上述每次段创建、边界/最高级别变化、合并与撤回都会写入变更流（见 `GET /segment-changes`），供下游增量同步；历史段（变更流上线前已存在）不补录，订阅从部署后的新变更开始。
+- **人工确认**（`POST /segments/{id}/acknowledgements`）不改段、不改 revision：它是对"某 revision 已被人工看过并处置"的只追加审计，按 `expected_revision` 做乐观锁（不符返回 409 与当前快照），按段内 `idempotency_key` 做幂等重放。段事后消失（合并/撤回删除）后历史确认仍保留在库。
 - 想评估调整 `SILENCE_INTERVAL_SECONDS` 的影响时，调用重分段预演接口（见 `GET /segments/resegmentation-preview`），可在不改动任何数据的前提下查看模拟段与现有段的 split/merged 映射。
 
 ## 本地开发与测试
@@ -269,8 +384,8 @@ python3 -m unittest tests.test_service -v
 
 ```
 app/
-  main.py      # FastAPI 路由与生命周期（启动时幂等建表）
-  service.py   # 归段/合并/去重/撤回核心逻辑与事件审计查询
+  main.py      # FastAPI 路由与生命周期（启动时幂等建表/升级）
+  service.py   # 归段/合并/去重/撤回、事件审计查询、人工确认审计核心逻辑
   schemas.py   # 请求/响应模型与校验
   severity.py  # 告警级别定义与排序
   db.py        # SQLite 连接、schema、事务
